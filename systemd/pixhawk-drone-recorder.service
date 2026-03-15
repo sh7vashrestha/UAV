@@ -1,0 +1,16 @@
+[Unit]
+Description=Pixhawk Drone Recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=drone
+WorkingDirectory=/home/drone/uav_mission/pixhawk_modular_project
+ExecStart=/usr/bin/python3 /home/drone/uav_mission/pixhawk_modular_project/run.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

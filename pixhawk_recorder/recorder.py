@@ -63,15 +63,15 @@ class PixhawkDroneRecorder:
         self.shutdown_done = False
         self.initialized = False
 
-        self.t0 = None
-        self.last_checkpoint_t = 0.0
-        self.last_rotate_t = 0.0
+        self.t0_monotonic = None
+        self.last_checkpoint_monotonic = 0.0
+        self.last_rotate_monotonic = 0.0
         self.segment_index = 0
         self.last_dets: List[Dict[str, object]] = []
         self.infer_count = 0
         self.last_logged_infer_id = -1
         self.current_segment_files: Dict[str, Path] = {}
-        self.last_telemetry_log = 0.0
+        self.last_telemetry_log_monotonic = 0.0
         self.postflight_threads: List[threading.Thread] = []
         self.flight_clock_use_pixhawk = False
         self.flight_clock_source = "SYSTEM"
@@ -116,6 +116,13 @@ class PixhawkDroneRecorder:
     def _wall_time_source(self) -> str:
         return self.flight_clock_source
 
+    def _elapsed_flight_sec(self, now_monotonic: Optional[float] = None) -> float:
+        if self.t0_monotonic is None:
+            return 0.0
+        if now_monotonic is None:
+            now_monotonic = time.monotonic()
+        return max(now_monotonic - self.t0_monotonic, 0.0)
+
     def _path_relative_to_run(self, path: Path) -> Path:
         if self.run_dir is None:
             return path
@@ -136,7 +143,7 @@ class PixhawkDroneRecorder:
         if not self.cfg.save_crop_geolocation_csv and not self.cfg.save_crop_geolocation_sidecars:
             return
 
-        if self.t0 is None:
+        if self.t0_monotonic is None:
             return
 
         record = build_crop_geolocation_record(
@@ -144,7 +151,7 @@ class PixhawkDroneRecorder:
             pix_tel,
             flight_name=self.cfg.run_name,
             infer_id=self.infer_count,
-            t_sec=now - self.t0,
+            t_sec=self._elapsed_flight_sec(now),
             detection_index=detection_index,
             crop_path=self._path_relative_to_run(crop_path),
             bbox=bbox,
@@ -266,7 +273,7 @@ class PixhawkDroneRecorder:
                 logger,
             )
 
-        self.last_rotate_t = time.time()
+        self.last_rotate_monotonic = time.monotonic()
         logger.info("Opened segment: %s", base)
 
     def _close_segment_writers(self) -> None:
@@ -284,6 +291,34 @@ class PixhawkDroneRecorder:
         self.thermal_writer = None
         self.stream_writer = None
 
+    def _close_capturers(self, *, log_errors: bool) -> None:
+        for attr_name, label in [
+            ("rgb_cap", "RGB capturer stop error"),
+            ("thermal_cap", "Thermal capturer stop error"),
+        ]:
+            cap = getattr(self, attr_name)
+            try:
+                if cap is not None:
+                    cap.stop()
+            except Exception as e:
+                if log_errors:
+                    logger.error("%s: %s", label, e)
+            setattr(self, attr_name, None)
+
+    def _close_csv_writers(self, *, log_errors: bool) -> None:
+        for attr_name, label in [
+            ("csv_writer", "CSV close error"),
+            ("geo_csv_writer", "Crop geolocation CSV close error"),
+        ]:
+            writer = getattr(self, attr_name)
+            try:
+                if writer is not None:
+                    writer.close()
+            except Exception as e:
+                if log_errors:
+                    logger.error("%s: %s", label, e)
+            setattr(self, attr_name, None)
+
     def _finalize_segment(self) -> None:
         if not self.current_segment_files or self.ckpt is None:
             return
@@ -292,7 +327,7 @@ class PixhawkDroneRecorder:
             "segment_index": self.segment_index,
             "closed_at": self._wall_time_strftime("%Y-%m-%d %H:%M:%S"),
             "closed_at_source": self._wall_time_source(),
-            "runtime_sec": round(time.time() - self.t0, 2) if self.t0 else 0.0,
+            "runtime_sec": round(self._elapsed_flight_sec(), 2),
         }
         for key, path in self.current_segment_files.items():
             row[f"{key}_path"] = str(path)
@@ -303,7 +338,7 @@ class PixhawkDroneRecorder:
         self.current_segment_files = {}
 
     def _rotate_segment_if_needed(self) -> None:
-        if time.time() - self.last_rotate_t < self.cfg.segment_duration_sec:
+        if time.monotonic() - self.last_rotate_monotonic < self.cfg.segment_duration_sec:
             return
 
         logger.info("Rotating segment")
@@ -314,13 +349,13 @@ class PixhawkDroneRecorder:
         self._open_segment_writers()
 
     def _save_checkpoint(self) -> bool:
-        if self.ckpt is None or self.t0 is None:
+        if self.ckpt is None or self.t0_monotonic is None:
             return False
 
         pix_tel = self.pixhawk.get_telemetry()
         return self.ckpt.save_checkpoint(
             {
-                "runtime_sec": round(time.time() - self.t0, 2),
+                "runtime_sec": round(self._elapsed_flight_sec(), 2),
                 "segment_index": self.segment_index,
                 "inferences": self.infer_count,
                 "free_gb": round(self.storage.free_gb(), 2),
@@ -379,29 +414,9 @@ class PixhawkDroneRecorder:
         self._prune_postflight_threads()
 
     def _cleanup_partial_init(self) -> None:
-        for cap in [self.rgb_cap, self.thermal_cap]:
-            try:
-                if cap is not None:
-                    cap.stop()
-            except Exception:
-                pass
-        self.rgb_cap = None
-        self.thermal_cap = None
+        self._close_capturers(log_errors=False)
         self._close_segment_writers()
-
-        try:
-            if self.csv_writer is not None:
-                self.csv_writer.close()
-        except Exception:
-            pass
-        self.csv_writer = None
-
-        try:
-            if self.geo_csv_writer is not None:
-                self.geo_csv_writer.close()
-        except Exception:
-            pass
-        self.geo_csv_writer = None
+        self._close_csv_writers(log_errors=False)
 
         self.initialized = False
         self.recording = False
@@ -412,7 +427,7 @@ class PixhawkDroneRecorder:
         else:
             logger.info("MANUAL MODE - starting recording immediately")
 
-        self.t0 = time.time()
+        self.t0_monotonic = time.monotonic()
         self._lock_flight_clock()
         self.cfg.run_name = self._wall_time_strftime("flight_%Y-%m-%d_%H-%M-%S")
         self.segment_index = 0
@@ -420,9 +435,9 @@ class PixhawkDroneRecorder:
         self.last_logged_infer_id = -1
         self.last_dets = []
         self.current_segment_files = {}
-        self.last_checkpoint_t = 0.0
-        self.last_rotate_t = 0.0
-        self.last_telemetry_log = 0.0
+        self.last_checkpoint_monotonic = 0.0
+        self.last_rotate_monotonic = 0.0
+        self.last_telemetry_log_monotonic = 0.0
 
         try:
             self._setup_flight_dir()
@@ -464,7 +479,7 @@ class PixhawkDroneRecorder:
             raise
 
     def _log_detections_once(self, infer_id: int, now: float) -> None:
-        if self.csv_writer is None or infer_id == self.last_logged_infer_id or self.t0 is None:
+        if self.csv_writer is None or infer_id == self.last_logged_infer_id or self.t0_monotonic is None:
             return
 
         self.last_logged_infer_id = infer_id
@@ -473,7 +488,7 @@ class PixhawkDroneRecorder:
             self.csv_writer.write(
                 [
                     infer_id,
-                    f"{now - self.t0:.3f}",
+                    f"{self._elapsed_flight_sec(now):.3f}",
                     det["cls"],
                     det["name"],
                     f"{det['conf']:.3f}",
@@ -485,14 +500,14 @@ class PixhawkDroneRecorder:
             )
 
     def run_flight(self) -> None:
-        next_infer = time.time()
+        next_infer = time.monotonic()
         infer_period = 1.0 / max(self.cfg.inference_fps, 1)
-        last_print = time.time()
+        last_print = time.monotonic()
         use_pixhawk = self.cfg.use_pixhawk
 
         try:
             while self.keep_running and self.recording and (not use_pixhawk or self.pixhawk.is_armed()):
-                now = time.time()
+                now = time.monotonic()
 
                 if use_pixhawk:
                     pix_tel = self.pixhawk.get_telemetry()
@@ -572,21 +587,21 @@ class PixhawkDroneRecorder:
                             except Exception as e:
                                 logger.error("Crop save error: %s", e)
 
-                if now - self.last_checkpoint_t >= self.cfg.checkpoint_interval_sec:
-                    self.last_checkpoint_t = now
+                if now - self.last_checkpoint_monotonic >= self.cfg.checkpoint_interval_sec:
+                    self.last_checkpoint_monotonic = now
                     if not self._save_checkpoint():
                         self.telemetry_obj.checkpoint_errors += 1
 
-                if use_pixhawk and pix_tel is not None and now - self.last_telemetry_log >= self.cfg.telemetry_log_interval_sec:
-                    self.last_telemetry_log = now
-                    pix_tel.timestamp = now - self.t0
+                if use_pixhawk and pix_tel is not None and now - self.last_telemetry_log_monotonic >= self.cfg.telemetry_log_interval_sec:
+                    self.last_telemetry_log_monotonic = now
+                    pix_tel.timestamp = self._elapsed_flight_sec(now)
                     pix_tel.frame_count = self.rgb_cap.frame_count if self.rgb_cap else 0
                     if self.ckpt is not None:
                         self.ckpt.log_flight_telemetry(pix_tel)
 
                 if now - last_print >= 5.0:
                     last_print = now
-                    elapsed = max(now - self.t0, 0.1)
+                    elapsed = max(self._elapsed_flight_sec(now), 0.1)
                     if use_pixhawk and pix_tel is not None:
                         logger.info(
                             "FLIGHT | Alt=%.1fm | Spd=%.1fm/s | Bat=%.1fV (%.0f%%) | RGB=%.0f/s | Infer=%.0f/s det=%d | Free=%.1fGB",
@@ -622,31 +637,10 @@ class PixhawkDroneRecorder:
         logger.info("Finalizing recording")
         self.recording = False
 
-        for cap in [self.rgb_cap, self.thermal_cap]:
-            try:
-                if cap is not None:
-                    cap.stop()
-            except Exception as e:
-                logger.error("Capturer stop error: %s", e)
-        self.rgb_cap = None
-        self.thermal_cap = None
-
+        self._close_capturers(log_errors=True)
         self._close_segment_writers()
         self._finalize_segment()
-
-        try:
-            if self.csv_writer is not None:
-                self.csv_writer.close()
-        except Exception as e:
-            logger.error("CSV close error: %s", e)
-        self.csv_writer = None
-
-        try:
-            if self.geo_csv_writer is not None:
-                self.geo_csv_writer.close()
-        except Exception as e:
-            logger.error("Crop geolocation CSV close error: %s", e)
-        self.geo_csv_writer = None
+        self._close_csv_writers(log_errors=True)
 
         try:
             if self.ckpt is not None:
@@ -662,7 +656,7 @@ class PixhawkDroneRecorder:
         except Exception as e:
             logger.error("Flight log flush error: %s", e)
 
-        runtime = time.time() - self.t0 if self.t0 else 0.0
+        runtime = self._elapsed_flight_sec()
         pix_tel = self.pixhawk.get_telemetry()
         metadata = {
             "flight_name": self.cfg.run_name,

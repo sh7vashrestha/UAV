@@ -26,7 +26,7 @@ class Capturer:
         self.frame_count = 0
         self.error_count = 0
         self._count = 0
-        self._t0 = time.time()
+        self._fps_window_start = time.monotonic()
         self.thread = None
 
         for _ in range(20):
@@ -51,11 +51,11 @@ class Capturer:
                         self.latest = frame
                     self._count += 1
                     self.frame_count += 1
-                    dt = time.time() - self._t0
+                    dt = time.monotonic() - self._fps_window_start
                     if dt >= 1.0:
                         self.fps = self._count / dt
                         self._count = 0
-                        self._t0 = time.time()
+                        self._fps_window_start = time.monotonic()
                 else:
                     self.error_count += 1
                     time.sleep(0.01)
@@ -185,7 +185,7 @@ class CSVWriter:
         self.running = True
         self.written = 0
         self.error_count = 0
-        self.last_flush = time.time()
+        self.last_flush = time.monotonic()
         self.file = None
         self.writer = None
 
@@ -226,7 +226,7 @@ class CSVWriter:
                 except queue.Empty:
                     pass
 
-                now = time.time()
+                now = time.monotonic()
                 if rows and (now - self.last_flush >= self.flush_interval_sec or len(rows) >= 50):
                     self._flush_rows(rows)
                     rows = []

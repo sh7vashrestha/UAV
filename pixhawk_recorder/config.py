@@ -86,7 +86,7 @@ class Config:
     save_csv: bool = True
     save_crops: bool = True
     save_crop_geolocation_csv: bool = True
-    save_crop_geolocation_sidecars: bool = True
+    save_crop_geolocation_sidecars: bool = False
     geolocation_min_altitude_m: float = 0.5
 
     # Streaming

@@ -104,7 +104,7 @@ Pixhawk time is not available yet, the recorder falls back to the Jetson system 
 ### Crop Geolocation
 When crop saving is enabled, the recorder also writes:
 - `rgb/crop_geolocation.csv`
-- one JSON sidecar per crop image in `crops/`
+- optionally, one JSON sidecar per crop image in `crops/`
 
 Each row/sidecar stores the crop path, detection box, drone GPS, altitude, roll/pitch/yaw, and an
 estimated ground GPS point for the detection center. The first-pass estimate uses:
@@ -115,6 +115,7 @@ estimated ground GPS point for the detection center. The first-pass estimate use
 
 This is implemented in `pixhawk_recorder/geolocation.py`. It is a practical first estimate, not
 survey-grade mapping, so calibration and terrain handling would be the next accuracy upgrades.
+JSON sidecars are disabled by default; set `save_crop_geolocation_sidecars = True` if you want them.
 
 ### Optional Jetson auto-merge
 To merge segments automatically on the Jetson after each flight stops, enable this in

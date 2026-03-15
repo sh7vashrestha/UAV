@@ -126,8 +126,13 @@ def load_manifest_paths(flight_dir: Path) -> Dict[str, List[Path]]:
     return paths
 
 
-def collect_segments(flight_dir: Path, stream_name: str) -> List[Path]:
-    manifest_paths = load_manifest_paths(flight_dir)
+def collect_segments(
+    flight_dir: Path,
+    stream_name: str,
+    manifest_paths: Dict[str, List[Path]] | None = None,
+) -> List[Path]:
+    if manifest_paths is None:
+        manifest_paths = load_manifest_paths(flight_dir)
     stream_cfg = STREAMS[stream_name]
     globbed = sorted((flight_dir / stream_cfg["subdir"]).glob(stream_cfg["pattern"]))
 
@@ -225,9 +230,10 @@ def merge_flight_segments(
         else (flight_dir / "merged").resolve()
     )
 
+    manifest_paths = load_manifest_paths(flight_dir)
     merged: Dict[str, Path] = {}
     for stream_name in stream_names:
-        segments = collect_segments(flight_dir, stream_name)
+        segments = collect_segments(flight_dir, stream_name, manifest_paths)
         if not segments:
             _report(report, f"Skipping {stream_name}: no segments found in {flight_dir}")
             continue

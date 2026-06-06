@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local OS/editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Local Codex/session files
+.codex
+.codex/
+
+# Flight data and generated post-processing outputs
+Videos/
+flights/
+damage_records/
+building_records/
+merged/
+crops/
+
+# Runtime logs and temporary files
+*.log
+*.tmp

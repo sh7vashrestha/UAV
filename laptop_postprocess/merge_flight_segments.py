@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "flight_dir",
         type=Path,
-        help="Path to a single flight directory, for example flight_20260309_143906",
+        help="Path to a single flight directory, for example flight_0001",
     )
     parser.add_argument(
         "--output-dir",

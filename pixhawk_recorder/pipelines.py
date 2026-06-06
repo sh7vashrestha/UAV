@@ -10,7 +10,7 @@ def build_rgb_capture_pipeline(cfg: Config) -> str:
         f"nvarguscamerasrc sensor-id={cfg.rgb_sensor_id} ! "
         f"video/x-raw(memory:NVMM),width={cfg.rgb_width},height={cfg.rgb_height},"
         f"format=NV12,framerate={cfg.rgb_capture_fps}/1 ! "
-        "nvvidconv flip-method=0 ! "
+        f"nvvidconv flip-method={cfg.rgb_flip_method} ! "
         f"video/x-raw,width={cfg.rgb_width},height={cfg.rgb_height},format=BGRx ! "
         "videoconvert ! video/x-raw,format=BGR ! "
         "appsink drop=true max-buffers=1 sync=false emit-signals=false"

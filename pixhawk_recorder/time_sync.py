@@ -60,7 +60,7 @@ class PixhawkTimeSync:
         raise RuntimeError("Pixhawk time is not available yet")
 
     def strftime(self, fmt: str, fallback_to_system: bool = True) -> str:
-        return datetime.fromtimestamp(self.now_epoch(fallback_to_system)).strftime(fmt)
+        return datetime.utcfromtimestamp(self.now_epoch(fallback_to_system)).strftime(fmt)
 
     def _current_epoch_locked(self) -> Optional[float]:
         if self._unix_epoch_at_sync is None:

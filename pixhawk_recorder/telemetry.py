@@ -8,6 +8,10 @@ from typing import Any, Dict, Optional
 class PixhawkTelemetry:
     timestamp: float = 0.0
 
+    connection_status: str = "DISCONNECTED"
+    vehicle_system_id: Optional[int] = None
+    vehicle_component_id: Optional[int] = None
+
     is_armed: bool = False
     flight_mode: str = "UNKNOWN"
 

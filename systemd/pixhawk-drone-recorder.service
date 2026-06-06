@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=drone
 WorkingDirectory=/home/drone/uav_mission/pixhawk_modular_project
+ExecStartPre=/bin/sleep 15
 ExecStart=/usr/bin/python3 /home/drone/uav_mission/pixhawk_modular_project/run.py
 Restart=always
 RestartSec=3

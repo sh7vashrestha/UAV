@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import asdict
@@ -14,6 +15,7 @@ import torch
 
 from .checkpoint import CheckpointManager
 from .config import Config
+from .damage_aggregation import aggregate_flight_damage_records
 from .geolocation import GEOLOCATION_CSV_HEADER, build_crop_geolocation_record, csv_row_from_record
 from .postflight_merge import merge_flight_segments
 from .pipelines import (
@@ -25,12 +27,13 @@ from .pipelines import (
 from .pixhawk import PixhawkManager
 from .storage import StorageManager
 from .telemetry import ErrorTelemetry
-from .utils import draw_dets, safe_stem, thermal_to_bgr
+from .utils import class_dir_name, draw_dets, safe_stem, thermal_to_bgr
 from .video_io import CSVWriter, Capturer, Writer
 from .yolo_engine import OrinNanoYOLOEngine
 
 
 logger = logging.getLogger("sdrec")
+FLIGHT_NAME_RE = re.compile(r"^flight_(\d+)$")
 
 
 class PixhawkDroneRecorder:
@@ -75,6 +78,7 @@ class PixhawkDroneRecorder:
         self.postflight_threads: List[threading.Thread] = []
         self.flight_clock_use_pixhawk = False
         self.flight_clock_source = "SYSTEM"
+        self._recent_saved_crops: List[Dict[str, object]] = []
 
     def _attach_run_logger(self) -> None:
         self._detach_run_logger()
@@ -131,6 +135,55 @@ class PixhawkDroneRecorder:
         except ValueError:
             return path
 
+    def _format_flight_name(self, index: int) -> str:
+        return f"flight_{index:04d}"
+
+    def _max_existing_flight_index(self) -> int:
+        if not self.cfg.save_root.exists():
+            return 0
+
+        max_index = 0
+        for path in self.cfg.save_root.iterdir():
+            if not path.is_dir():
+                continue
+            match = FLIGHT_NAME_RE.fullmatch(path.name)
+            if match is None:
+                continue
+            max_index = max(max_index, int(match.group(1)))
+        return max_index
+
+    def _read_last_flight_index(self, counter_file: Path) -> int:
+        if not counter_file.exists():
+            return 0
+
+        try:
+            return max(int(counter_file.read_text(encoding="utf-8").strip()), 0)
+        except Exception:
+            logger.warning("Ignoring invalid flight counter file: %s", counter_file)
+            return 0
+
+    def _next_run_name(self) -> str:
+        self.storage.ensure_writable()
+        self.cfg.save_root.mkdir(parents=True, exist_ok=True)
+
+        counter_file = self.cfg.save_root / ".flight_counter"
+        next_index = max(
+            self._read_last_flight_index(counter_file),
+            self._max_existing_flight_index(),
+        ) + 1
+
+        while (self.cfg.save_root / self._format_flight_name(next_index)).exists():
+            next_index += 1
+
+        tmp_file = counter_file.parent / f"{counter_file.name}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as handle:
+            handle.write(f"{next_index}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_file.replace(counter_file)
+
+        return self._format_flight_name(next_index)
+
     def _write_crop_geolocation(
         self,
         crop_path: Path,
@@ -169,9 +222,84 @@ class PixhawkDroneRecorder:
             sidecar_path = crop_path.with_suffix(".json")
             try:
                 with open(sidecar_path, "w", encoding="utf-8") as handle:
-                    json.dump(record, handle, indent=2)
+                    json.dump(record.to_dict(), handle, indent=2)
             except Exception as e:
                 logger.error("Crop geolocation sidecar error: %s", e)
+
+    def _crop_class_dir(self, class_name: object) -> Path:
+        if self.crop_dir is None:
+            raise RuntimeError("Crop directory is not initialized")
+
+        class_dir = self.crop_dir / class_dir_name(class_name)
+        class_dir.mkdir(parents=True, exist_ok=True)
+        return class_dir
+
+    @staticmethod
+    def _bbox_iou(
+        box_a: tuple[int, int, int, int],
+        box_b: tuple[int, int, int, int],
+    ) -> float:
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0, inter_x2 - inter_x1)
+        inter_h = max(0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+        if inter_area <= 0:
+            return 0.0
+
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        union_area = area_a + area_b - inter_area
+        if union_area <= 0:
+            return 0.0
+        return inter_area / union_area
+
+    def _prune_recent_saved_crops(self, now: float) -> None:
+        cooldown = self.cfg.save_crop_dedup_cooldown_sec
+        if cooldown <= 0:
+            self._recent_saved_crops = []
+            return
+
+        self._recent_saved_crops = [
+            record
+            for record in self._recent_saved_crops
+            if now - float(record["saved_at"]) <= cooldown
+        ]
+
+    def _should_save_crop(
+        self,
+        det: Dict[str, object],
+        bbox: tuple[int, int, int, int],
+        now: float,
+    ) -> bool:
+        if not self.cfg.save_crop_dedup_enabled:
+            return True
+
+        self._prune_recent_saved_crops(now)
+
+        try:
+            class_id = int(det["cls"])
+        except (KeyError, TypeError, ValueError):
+            class_id = -1
+
+        for record in self._recent_saved_crops:
+            if int(record["class_id"]) != class_id:
+                continue
+            if self._bbox_iou(record["bbox"], bbox) >= self.cfg.save_crop_dedup_iou_threshold:
+                return False
+
+        self._recent_saved_crops.append(
+            {
+                "class_id": class_id,
+                "bbox": bbox,
+                "saved_at": now,
+            }
+        )
+        return True
 
     def _setup_flight_dir(self) -> None:
         self.run_dir = self.cfg.save_root / self.cfg.run_name
@@ -192,7 +320,7 @@ class PixhawkDroneRecorder:
         self._attach_run_logger()
 
     def _segment_base(self) -> str:
-        return f"seg_{self._wall_time_strftime('%Y%m%d_%H%M%S')}_{self.segment_index:04d}"
+        return f"seg_{self.segment_index:04d}"
 
     def _open_segment_writers(self) -> None:
         self._close_segment_writers()
@@ -403,6 +531,61 @@ class PixhawkDroneRecorder:
         thread.start()
         logger.info("Started background post-flight merge for %s", flight_dir)
 
+    def _run_damage_record_aggregation(self, flight_dir: Path) -> None:
+        csv_path = flight_dir / "crops" / "crop_geolocation.csv"
+        if not csv_path.exists():
+            logger.info(
+                "Damage aggregation [%s]: skipped because %s was not found",
+                flight_dir.name,
+                csv_path,
+            )
+            return
+
+        try:
+            result = aggregate_flight_damage_records(
+                flight_dir,
+                spatial_threshold_m=self.cfg.damage_record_spatial_threshold_m,
+                temporal_threshold_sec=self.cfg.damage_record_temporal_threshold_sec,
+                consensus_method=self.cfg.damage_record_consensus_method,
+                top_k=self.cfg.damage_record_top_k,
+                debug_raw_detections=self.cfg.damage_record_debug_raw_detections,
+            )
+            logger.info(
+                "Damage aggregation [%s]: %d detections collapsed into %d building records",
+                flight_dir.name,
+                result.summary.total_frame_level_detections,
+                result.summary.total_building_level_records,
+            )
+            logger.info(
+                "Damage aggregation [%s]: global confidence %.4f, duplicate reduction %.3f",
+                flight_dir.name,
+                result.summary.global_confidence_score,
+                result.summary.duplicate_reduction_ratio,
+            )
+            logger.info(
+                "Damage aggregation [%s]: saved %s, %s, and %s",
+                flight_dir.name,
+                result.json_path,
+                result.csv_path,
+                result.graph_pdf_path,
+            )
+        except Exception as e:
+            logger.error("Damage aggregation [%s] failed: %s", flight_dir.name, e)
+
+    def _start_damage_record_aggregation(self, flight_dir: Optional[Path]) -> None:
+        if not self.cfg.auto_aggregate_damage_records_after_flight or flight_dir is None:
+            return
+
+        self._prune_postflight_threads()
+        thread = threading.Thread(
+            target=self._run_damage_record_aggregation,
+            args=(flight_dir,),
+            name=f"damage-aggregation-{flight_dir.name}",
+        )
+        self.postflight_threads.append(thread)
+        thread.start()
+        logger.info("Started background damage-record aggregation for %s", flight_dir)
+
     def _wait_for_postflight_threads(self) -> None:
         self._prune_postflight_threads()
         current = threading.current_thread()
@@ -429,7 +612,7 @@ class PixhawkDroneRecorder:
 
         self.t0_monotonic = time.monotonic()
         self._lock_flight_clock()
-        self.cfg.run_name = self._wall_time_strftime("flight_%Y-%m-%d_%H-%M-%S")
+        self.cfg.run_name = self._next_run_name()
         self.segment_index = 0
         self.infer_count = 0
         self.last_logged_infer_id = -1
@@ -438,6 +621,7 @@ class PixhawkDroneRecorder:
         self.last_checkpoint_monotonic = 0.0
         self.last_rotate_monotonic = 0.0
         self.last_telemetry_log_monotonic = 0.0
+        self._recent_saved_crops = []
 
         try:
             self._setup_flight_dir()
@@ -462,7 +646,7 @@ class PixhawkDroneRecorder:
                 )
             if self.cfg.save_crops and self.cfg.save_crop_geolocation_csv:
                 self.geo_csv_writer = CSVWriter(
-                    self.rgb_dir / "crop_geolocation.csv",
+                    self.crop_dir / "crop_geolocation.csv",
                     flush_interval_sec=self.cfg.csv_flush_interval_sec,
                     logger=logger,
                     header=GEOLOCATION_CSV_HEADER,
@@ -546,7 +730,7 @@ class PixhawkDroneRecorder:
 
                 if rgb is not None and self.raw_writer is not None:
                     self.raw_writer.push(rgb)
-                    annot = draw_dets(rgb.copy(), self.last_dets) if self.last_dets else rgb
+                    annot = draw_dets(rgb.copy(), self.last_dets, self.cfg) if self.last_dets else rgb
                     if self.annot_writer is not None:
                         self.annot_writer.push(annot)
                     if self.stream_writer is not None:
@@ -566,11 +750,15 @@ class PixhawkDroneRecorder:
                                 x1, y1, x2, y2 = det["bbox"]
                                 if x2 <= x1 or y2 <= y1:
                                     continue
+                                bbox = (x1, y1, x2, y2)
+                                if not self._should_save_crop(det, bbox, now):
+                                    continue
                                 crop = rgb[y1:y2, x1:x2]
                                 if crop.size == 0:
                                     continue
+                                class_crop_dir = self._crop_class_dir(det["name"])
                                 crop_name = (
-                                    self.crop_dir
+                                    class_crop_dir
                                     / f"infer{self.infer_count:07d}_det{j:02d}_{safe_stem(det['name'])}_{det['conf']:.2f}.jpg"
                                 )
                                 if not cv2.imwrite(str(crop_name), crop):
@@ -580,7 +768,7 @@ class PixhawkDroneRecorder:
                                     crop_path=crop_name,
                                     det=det,
                                     pix_tel=pix_tel,
-                                    bbox=(x1, y1, x2, y2),
+                                    bbox=bbox,
                                     detection_index=j,
                                     now=now,
                                 )
@@ -604,7 +792,9 @@ class PixhawkDroneRecorder:
                     elapsed = max(self._elapsed_flight_sec(now), 0.1)
                     if use_pixhawk and pix_tel is not None:
                         logger.info(
-                            "FLIGHT | Alt=%.1fm | Spd=%.1fm/s | Bat=%.1fV (%.0f%%) | RGB=%.0f/s | Infer=%.0f/s det=%d | Free=%.1fGB",
+                            "FLIGHT | Link=%s | Mode=%s | Alt=%.1fm | Spd=%.1fm/s | Bat=%.1fV (%.0f%%) | RGB=%.0f/s | Infer=%.0f/s det=%d | Free=%.1fGB",
+                            pix_tel.connection_status,
+                            pix_tel.flight_mode,
                             pix_tel.altitude_relative,
                             pix_tel.ground_speed,
                             pix_tel.battery_voltage,
@@ -666,6 +856,10 @@ class PixhawkDroneRecorder:
             "total_inferences": self.infer_count,
             "total_segments": self.segment_index + 1 if self.initialized else 0,
             "pixhawk_connected": self.pixhawk.is_connected() if self.cfg.use_pixhawk else False,
+            "pixhawk_ever_connected": self.pixhawk.ever_connected if self.cfg.use_pixhawk else False,
+            "pixhawk_connection_status": pix_tel.connection_status if self.cfg.use_pixhawk else "DISABLED",
+            "pixhawk_vehicle_system_id": pix_tel.vehicle_system_id if self.cfg.use_pixhawk else None,
+            "pixhawk_vehicle_component_id": pix_tel.vehicle_component_id if self.cfg.use_pixhawk else None,
             "battery_voltage_end": round(pix_tel.battery_voltage, 2),
             "battery_percent_end": round(pix_tel.battery_remaining, 1),
             "altitude_end": round(pix_tel.altitude_relative, 1),
@@ -689,6 +883,7 @@ class PixhawkDroneRecorder:
 
         self.initialized = False
         self._detach_run_logger()
+        self._start_damage_record_aggregation(flight_dir)
         self._start_postflight_merge(flight_dir)
 
     def main_loop(self) -> None:
@@ -757,7 +952,7 @@ class PixhawkDroneRecorder:
             except Exception as e:
                 logger.error("Shutdown stop error: %s", e)
 
-        if self.cfg.auto_merge_after_flight:
+        if self.cfg.auto_merge_after_flight or self.cfg.auto_aggregate_damage_records_after_flight:
             self._wait_for_postflight_threads()
 
         try:
